@@ -15,6 +15,7 @@ import time
 import warnings
 from datetime import datetime
 import locale
+from pkg_resources import parse_version
 
 import yaml
 from six import iteritems, print_, string_types
@@ -490,7 +491,7 @@ class Node(object):
 
         Emits a warning if not listening after 10 seconds.
         """
-        if self.cluster.version() >= '1.2':
+        if parse_version(self.cluster.version()) >= parse_version('1.2'):
             self.watch_log_for("Starting listening for CQL clients", **kwargs)
 
         binary_itf = self.network_interfaces['binary']
@@ -708,11 +709,13 @@ class Node(object):
                 break
             time.sleep(10)
 
-    def nodetool(self, cmd, capture_output=True, wait=True):
+    def nodetool(self, cmd, capture_output=True, wait=True, timeout=None):
         """
         Setting wait=False makes it impossible to detect errors,
         if capture_output is also False. wait=False allows us to return
         while nodetool is still running.
+        When wait=True, timeout may be set to a number, in seconds,
+        to limit how long the function will wait for nodetool to complete.
         """
         if capture_output and not wait:
             raise common.ArgumentError("Cannot set capture_output while wait is False.")
@@ -732,7 +735,7 @@ class Node(object):
             stdout, stderr = None, None
 
         if wait:
-            exit_status = p.wait()
+            exit_status = p.wait(timeout=timeout)
             if exit_status != 0:
                 raise NodetoolError(" ".join(args), exit_status, stdout, stderr)
 
@@ -800,6 +803,8 @@ class Node(object):
 
     def run_cqlsh(self, cmds=None, show_output=False, cqlsh_options=[], return_output=False):
         cqlsh = self.get_tool('cqlsh')
+        if not isinstance(cqlsh, list):
+            cqlsh = [cqlsh]
         env = self.get_env()
         host = self.network_interfaces['thrift'][0]
         if self.get_base_cassandra_version() >= 2.1:
@@ -810,11 +815,11 @@ class Node(object):
         sys.stdout.flush()
         if cmds is None:
             if common.is_win():
-                subprocess.Popen([cqlsh] + args, env=env, creationflags=subprocess.CREATE_NEW_CONSOLE, universal_newlines=True)
+                subprocess.Popen(cqlsh + args, env=env, creationflags=subprocess.CREATE_NEW_CONSOLE, universal_newlines=True)
             else:
                 os.execve(cqlsh, [common.platform_binary('cqlsh')] + args, env)
         else:
-            p = subprocess.Popen([cqlsh] + args, env=env, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+            p = subprocess.Popen(cqlsh + args, env=env, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
             for cmd in cmds.split(';'):
                 cmd = cmd.strip()
                 if cmd:
@@ -1014,6 +1019,7 @@ class Node(object):
         cdir = self.get_install_dir()
         sstablelevelreset = self._find_cmd('sstablelevelreset')
         env = self.get_env()
+        sstablefiles = self.__cleanup_sstables(keyspace, cf)
 
         cmd = [sstablelevelreset, "--really-reset", keyspace, cf]
 
@@ -1029,6 +1035,7 @@ class Node(object):
         cdir = self.get_install_dir()
         sstableofflinerelevel = self._find_cmd('sstableofflinerelevel')
         env = self.get_env()
+        sstablefiles = self.__cleanup_sstables(keyspace, cf)
 
         if dry_run:
             cmd = [sstableofflinerelevel, "--dry-run", keyspace, cf]
@@ -1046,6 +1053,7 @@ class Node(object):
     def run_sstableverify(self, keyspace, cf, options=None, output=False):
         sstableverify = self.get_tool('sstableverify')
         env = self.get_env()
+        sstablefiles = self.__cleanup_sstables(keyspace, cf)
 
         cmd = [sstableverify, keyspace, cf]
         if options is not None:
@@ -1081,7 +1089,7 @@ class Node(object):
         keyspaces.remove('system_schema')
         return keyspaces
 
-    def get_sstables(self, keyspace, column_family):
+    def get_sstables(self, keyspace, column_family, ignore_unsealed=True, cleanup_unsealed=False):
         keyspace_dir = os.path.join(self.get_path(), 'data', keyspace)
         cf_glob = '*'
         if column_family:
@@ -1102,6 +1110,14 @@ class Node(object):
             files = glob.glob(os.path.join(keyspace_dir, cf_glob, "*big-Data.db"))
         for f in files:
             if os.path.exists(f.replace('Data.db', 'Compacted')):
+                files.remove(f)
+            if (ignore_unsealed or cleanup_unsealed) and os.path.exists(f.replace('Data.db', 'TOC.txt.tmp')):
+                if cleanup_unsealed:
+                    print_("get_sstables: Cleaning up unsealed SSTable: {}".format(f))
+                    for i in glob.glob(f.replace('Data.db', '*')):
+                        os.remove(i)
+                else:
+                    print_("get_sstables: Ignoring unsealed SSTable: {}".format(f))
                 files.remove(f)
         return files
 
@@ -1253,8 +1269,8 @@ class Node(object):
         self.status = Status.DECOMMISSIONED
         self._update_config()
 
-    def hostid(self):
-        info = self.nodetool('info', capture_output=True)[0]
+    def hostid(self, timeout=60):
+        info = self.nodetool('info', capture_output=True, timeout=timeout)[0]
         id_lines = [s for s in info.split('\n')
                     if s.startswith('ID')]
         if not len(id_lines) == 1:
@@ -1430,7 +1446,7 @@ class Node(object):
         data['data_file_directories'] = [os.path.join(self.get_path(), 'data')]
         data['commitlog_directory'] = os.path.join(self.get_path(), 'commitlogs')
         data['saved_caches_directory'] = os.path.join(self.get_path(), 'saved_caches')
-        if self.get_cassandra_version() > '3.0' and 'hints_directory' in yaml_text:
+        if parse_version(self.get_cassandra_version()) > parse_version('3.0') and 'hints_directory' in yaml_text:
             data['hints_directory'] = os.path.join(self.get_path(), 'data', 'hints')
 
         if self.cluster.partitioner:
@@ -1490,7 +1506,7 @@ class Node(object):
 
     def __update_logback_loglevel(self, conf_file):
         # Setting the right log level - 2.2.2 introduced new debug log
-        if self.get_cassandra_version() >= '2.2.2' and self.__global_log_level:
+        if parse_version(self.get_cassandra_version()) >= parse_version('2.2.2') and self.__global_log_level:
             if self.__global_log_level in ['DEBUG', 'TRACE']:
                 root_log_level = self.__global_log_level
                 cassandra_log_level = self.__global_log_level
@@ -1541,7 +1557,7 @@ class Node(object):
             remote_debug_port_pattern = '((-Xrunjdwp:)|(-agentlib:jdwp=))transport=dt_socket,server=y,suspend=n,address='
             common.replace_in_file(conf_file, remote_debug_port_pattern, remote_debug_options)
 
-        if self.get_cassandra_version() < '2.0.1':
+        if parse_version(self.get_cassandra_version()) < parse_version('2.0.1'):
             common.replace_in_file(conf_file, "-Xss", '    JVM_OPTS="$JVM_OPTS -Xss228k"')
 
         for itf in list(self.network_interfaces.values()):
@@ -1751,6 +1767,14 @@ class Node(object):
                     files.append(datafile)
 
         return files
+
+    def __cleanup_sstables(self, keyspace, cf):
+        if keyspace != 'system_schema':
+            self.get_sstables('system_schema', '', cleanup_unsealed=True)
+        try:
+            return self.get_sstables(keyspace, cf, cleanup_unsealed=True)
+        except common.ArgumentError:
+            return []
 
     def _clean_win_jmx(self):
         if self.get_base_cassandra_version() >= 2.1:

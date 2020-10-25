@@ -5,6 +5,7 @@ import random
 import shutil
 import subprocess
 import time
+from pkg_resources import parse_version
 
 import yaml
 from six import iteritems, print_
@@ -40,13 +41,18 @@ class Cluster(object):
 
         # This is incredibly important for
         # backwards compatibility.
-        if 'cassandra_version' in kwargs:
-            version = kwargs['cassandra_version']
-        if 'cassandra_dir' in kwargs:
-            install_dir = kwargs['cassandra_dir']
+        version = kwargs.get('cassandra_version', version)
+        install_dir = kwargs.get('cassandra_dir', install_dir)
+        docker_image = kwargs.get('docker_image')
         if create_directory:
             # we create the dir before potentially downloading to throw an error sooner if need be
             os.mkdir(self.get_path())
+
+        if docker_image:
+            self.__install_dir = None
+            self.__version = '3.0'
+            self._update_config()
+            return
 
         try:
             if version is None:
@@ -196,7 +202,7 @@ class Cluster(object):
     def new_node(self, i, auto_bootstrap=False, debug=False, initial_token=None, add_node=True, is_seed=True, data_center=None):
         ipformat = self.get_ipformat()
         binary = None
-        if self.cassandra_version() >= '1.2':
+        if parse_version(self.version()) >= parse_version('1.2'):
             binary = self.get_binary_interface(i)
         node = self.create_node(name='node{}'.format(i),
                                 auto_bootstrap=auto_bootstrap,
@@ -238,7 +244,7 @@ class Cluster(object):
         return 2000 + nodeid * 100
 
     def balanced_tokens(self, node_count):
-        if self.cassandra_version() >= '1.2' and not self.partitioner:
+        if parse_version(self.version()) >= parse_version('1.2') and not self.partitioner:
             ptokens = [(i * (2 ** 64 // node_count)) for i in xrange(0, node_count)]
             return [int(t - 2 ** 63) for t in ptokens]
         return [int(i * (2 ** 127 // node_count)) for i in range(0, node_count)]
@@ -341,7 +347,7 @@ class Cluster(object):
         else:
             for node, p, mark in started:
                 try:
-                    start_message = "Listening for thrift clients..." if self.cassandra_version() < "2.2" else "Starting listening for CQL clients"
+                    start_message = "Listening for thrift clients..." if parse_version(self.version()) < parse_version("2.2") else "Starting listening for CQL clients"
                     node.watch_log_for(start_message, timeout=60, process=p, verbose=verbose, from_mark=mark)
                 except RuntimeError:
                     return None
@@ -352,7 +358,7 @@ class Cluster(object):
             if not node.is_running():
                 raise NodeError("Error starting {0}.".format(node.name), p)
 
-        if not no_wait and self.cassandra_version() >= "0.8":
+        if not no_wait and parse_version(self.version()) >= parse_version("0.8"):
             # 0.7 gossip messages seems less predictible that from 0.8 onwards and
             # I don't care enough
             for node, _, mark in started:
@@ -424,7 +430,7 @@ class Cluster(object):
         if len(livenodes) == 0:
             print_("No live node")
             return
-        if self.cassandra_version() <= '2.1':
+        if parse_version(self.version()) <= parse_version('2.1'):
             args = [stress, '-d', ",".join(livenodes)] + stress_options
         else:
             args = [stress] + stress_options + ['-node', ','.join(livenodes)]
